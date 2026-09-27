@@ -1,88 +1,148 @@
-# ============================================================================
-# 放到你自己 fork 的仓库里：.github/workflows/build-ipa.yml
-# 作用：在 GitHub 免费的 macOS 构建机上把 jev-chat-jarvis-ios 编成
-#       「未签名 ipa」，下载后用全能签自签安装。整个过程不需要 Mac。
+# Put this file in your fork at: .github/workflows/build-ipa.yml
+# Builds jev-chat-jarvis-ios into an UNSIGNED ipa on GitHub's free macOS runner.
+# Then sign it yourself (全能签 or any sideload signing tool). No Mac needed.
 #
-# 用法见同目录 README-自签安装.md。
+# Full walkthrough: README-自签安装.md
+#
+# v2 fixes (the previous run died with exit code 64):
+#   1) removed -derivedDataPath: xcodebuild requires -scheme when using it,
+#      but this project is built with -target
+#   2) bumped actions to current majors (v4 is three majors behind)
+#   3) dropped the third-party setup-xcode action: macos-latest is now
+#      macOS 26 + Xcode 27, which is the toolchain the author verified with
 # ============================================================================
 name: Build unsigned IPA
 
 on:
-  # 在 Actions 页面手动点按钮运行
+  # Click "Run workflow" on the Actions tab
   workflow_dispatch:
-  # 也可以每次 push 自动编一份
+  # Also build on every push
   push:
     branches: [master, main]
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    # 如果报错 "The label 'macos-15' is not supported"，把这行改成 macos-latest
-    runs-on: macos-15
-    timeout-minutes: 40
+    # macos-latest = macOS 26 + Xcode 27
+    # If this fails with "The label ... is not supported", try macos-15
+    runs-on: macos-latest
+    timeout-minutes: 45
 
     steps:
-      - name: 取代码
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
 
-      - name: 打印 Xcode 版本（方便排查）
+      - name: Environment info
         run: |
+          sw_vers
+          echo "---"
           xcodebuild -version
           echo "---"
           xcode-select -p
+          echo "--- installed Xcodes ---"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          echo "--- targets / schemes in the project ---"
+          xcodebuild -list -project JevJarvis.xcodeproj || true
 
-      - name: 尽量切到最新 Xcode（失败不阻塞）
-        continue-on-error: true
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest-stable
-
-      - name: 编译（完全不做签名）
+      - name: Build (no code signing at all)
+        # Deliberately no -derivedDataPath here: xcodebuild only accepts it
+        # together with -scheme, and -target is the author's verified way.
+        # The product path is asked for with -showBuildSettings in the next step.
         run: |
-          set -o pipefail
+          set -euo pipefail
           xcodebuild \
             -project JevJarvis.xcodeproj \
             -target JevJarvis \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build 2>&1 | tee build.log | tail -n 250
+            build 2>&1 | tee build.log | tail -n 80
 
-      - name: 检查产物里有没有键盘扩展
+      - name: Locate app, verify keyboard extension, package unsigned ipa
         run: |
-          APP="build/Build/Products/Release-iphoneos/JevJarvis.app"
-          echo "=== App 内容 ==="
-          ls -la "$APP"
-          echo "=== PlugIns（键盘扩展应该在这里）==="
-          ls -la "$APP/PlugIns" || true
-          if [ ! -d "$APP/PlugIns/JevKeyboard.appex" ]; then
-            echo "::error::没找到 JevKeyboard.appex，扩展没有被嵌进 App，打出来的包装上也用不了键盘"
+          set -euo pipefail
+
+          BUILT="$(xcodebuild -project JevJarvis.xcodeproj -target JevJarvis \
+                     -configuration Release -sdk iphoneos -showBuildSettings 2>/dev/null \
+                   | awk -F' = ' '/ BUILT_PRODUCTS_DIR = /{print $2; exit}')"
+          echo "BUILT_PRODUCTS_DIR = ${BUILT:-unknown}"
+
+          APP="${BUILT:-}/JevJarvis.app"
+          if [ ! -d "$APP" ]; then
+            echo "not at the expected path, searching DerivedData"
+            APP="$(find "$HOME/Library/Developer/Xcode/DerivedData" -type d -name 'JevJarvis.app' \
+                   -path '*Release-iphoneos*' 2>/dev/null | head -n 1 || true)"
+          fi
+          echo "APP = ${APP:-not found}"
+
+          if [ -z "$APP" ] || [ ! -d "$APP" ]; then
+            echo "::error::JevJarvis.app not found - build products are not where expected"
             exit 1
           fi
 
-      - name: 打成未签名 ipa
-        run: |
+          echo "=== App contents ==="
+          ls -la "$APP"
+          echo "=== PlugIns (the keyboard extension must be here) ==="
+          ls -la "$APP/PlugIns" || true
+
+          if [ ! -d "$APP/PlugIns/JevKeyboard.appex" ]; then
+            echo "::error::JevKeyboard.appex is missing - the extension was not embedded, the package would be useless"
+            exit 1
+          fi
+
           rm -rf Payload JevJarvis-unsigned.ipa
           mkdir -p Payload
-          cp -R "build/Build/Products/Release-iphoneos/JevJarvis.app" Payload/
+          cp -R "$APP" Payload/
           zip -qry JevJarvis-unsigned.ipa Payload
           ls -la JevJarvis-unsigned.ipa
-          echo "=== ipa 结构（应包含 JevKeyboard.appex）==="
-          unzip -l JevJarvis-unsigned.ipa | head -n 40
+          echo "=== ipa layout (should contain JevKeyboard.appex) ==="
+          unzip -l JevJarvis-unsigned.ipa | head -n 30
 
-      - name: 上传 ipa（在运行记录页底部 Artifacts 下载）
-        uses: actions/upload-artifact@v4
+      - name: Write result and errors to the run page (always)
+        if: always()
+        run: |
+          {
+            echo "## Result"
+            if [ -f JevJarvis-unsigned.ipa ]; then
+              echo "- OK: JevJarvis-unsigned.ipa built ($(du -h JevJarvis-unsigned.ipa | cut -f1))"
+              echo "- Download it under Artifacts at the bottom of this page"
+            else
+              echo "- FAILED: no ipa was produced (see the error lines below)"
+            fi
+            echo ""
+            echo "### Environment"
+            echo '```'
+            sw_vers || true
+            xcodebuild -version || true
+            echo '```'
+            if [ -f build.log ]; then
+              echo "### Error lines from the build log"
+              echo '```'
+              grep -i -E "error:|xcodebuild: error|requires a development team|The following build commands failed|Command .* failed" build.log | tail -n 40 || true
+              echo '```'
+              echo "### Last 30 lines of the log"
+              echo '```'
+              tail -n 30 build.log || true
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ipa (download under Artifacts)
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
           name: JevJarvis-unsigned-ipa
           path: JevJarvis-unsigned.ipa
-          if-no-files-found: error
+          if-no-files-found: warn
 
-      - name: 编译日志也传一份（失败了看它）
+      - name: Upload build log too
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: build-log
           path: build.log
