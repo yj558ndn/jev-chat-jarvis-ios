@@ -1,22 +1,28 @@
-# Put this file in your fork at: .github/workflows/build-ipa.yml
-# Builds jev-chat-jarvis-ios into an UNSIGNED ipa on GitHub's free macOS runner.
-# Then sign it yourself (全能签 or any sideload signing tool). No Mac needed.
+# ============================================================================
+# 放到你自己 fork 的仓库里：.github/workflows/build-ipa.yml
+# 作用：在 GitHub 免费的 macOS 构建机上把 jev-chat-jarvis-ios 编成
+#       「未签名 ipa」，下载后用全能签自签安装。整个过程不需要 Mac。
 #
-# Full walkthrough: README-自签安装.md
+# 用法见同目录 README-自签安装.md。
 #
-# v2 fixes (the previous run died with exit code 64):
-#   1) removed -derivedDataPath: xcodebuild requires -scheme when using it,
-#      but this project is built with -target
-#   2) bumped actions to current majors (v4 is three majors behind)
-#   3) dropped the third-party setup-xcode action: macos-latest is now
-#      macOS 26 + Xcode 27, which is the toolchain the author verified with
+# v3 相对 v2 的变化：编译前自动打一个补丁，让键盘不再依赖 App Group。
+#   为什么需要：自签时 .appex 常常拿不到 App Groups 权限，导致
+#   「主 App 能读共享容器、键盘读不到」——表现就是 App 首页第 1、2 行橙色，
+#   键盘上一直显示「还没配置生成层」，而「试一试」页却完全正常。
+#   补丁内容（App「模型」页加「复制配置到剪贴板」+ 键盘加「导入配置」）
+#   在下面 "打补丁" 那一步里，锚点没命中会直接报错中止，不会出一个半成品包。
+#
+# v2 修的三处（保留）：
+#   1) 去掉 -derivedDataPath：它必须配 -scheme，而我们用 -target
+#   2) action 版本升到当前最新
+#   3) 去掉第三方 setup-xcode：macos-latest 就是 macOS 26 + Xcode 27
 # ============================================================================
 name: Build unsigned IPA
 
 on:
-  # Click "Run workflow" on the Actions tab
+  # 在 Actions 页面手动点按钮运行
   workflow_dispatch:
-  # Also build on every push
+  # 每次 push 也自动编一份
   push:
     branches: [master, main]
 
@@ -25,31 +31,233 @@ permissions:
 
 jobs:
   build:
-    # macos-latest = macOS 26 + Xcode 27
-    # If this fails with "The label ... is not supported", try macos-15
+    # macos-latest = macOS 26 + Xcode 27（与作者验证过的工具链一致）
+    # 如果这行报 "The label ... is not supported"，改成 macos-15 试试
     runs-on: macos-latest
     timeout-minutes: 45
 
     steps:
-      - name: Checkout
+      - name: 取代码
         uses: actions/checkout@v7
 
-      - name: Environment info
+      - name: 环境信息（排查用）
         run: |
           sw_vers
           echo "---"
           xcodebuild -version
           echo "---"
           xcode-select -p
-          echo "--- installed Xcodes ---"
+          echo "--- 机器上装了哪些 Xcode ---"
           ls -d /Applications/Xcode*.app 2>/dev/null || true
-          echo "--- targets / schemes in the project ---"
+          echo "--- 工程里有哪些 target / scheme ---"
           xcodebuild -list -project JevJarvis.xcodeproj || true
 
-      - name: Build (no code signing at all)
-        # Deliberately no -derivedDataPath here: xcodebuild only accepts it
-        # together with -scheme, and -target is the author's verified way.
-        # The product path is asked for with -showBuildSettings in the next step.
+      - name: 打补丁：让键盘不依赖 App Group
+        run: |
+          cat > /tmp/patch-appgroup.mjs <<'JSPATCH'
+          // ============================================================================
+          // 让键盘不再依赖 App Group（自签常见问题：主 App 能进共享容器，.appex 进不去）
+          //
+          // 原理：加一条"剪贴板搬运"通道。
+          //   App「模型」页新增「复制配置到剪贴板」
+          //   键盘待机页新增「导入配置」——把剪贴板里的配置存进【键盘自己的容器】
+          // 键盘只要拿到「允许完全访问」就能读剪贴板，因此共享容器通不通都无所谓。
+          //
+          // 用法：node patch-appgroup.mjs <仓库根目录>
+          // 任何锚点没命中都会立刻退出码 1（宁可不构建，也不出一个打了半截补丁的包）。
+          // ============================================================================
+          import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+          import { join } from 'node:path';
+
+          const root = process.argv[2] || '.';
+
+          let hits = 0;
+          function patch(rel, anchor, replacement, label) {
+            const p = join(root, rel);
+            if (!existsSync(p)) {
+              console.error('✗ 找不到文件：' + rel);
+              process.exit(1);
+            }
+            const src = readFileSync(p, 'utf8');
+            const count = src.split(anchor).length - 1;
+            if (count !== 1) {
+              console.error('✗ 锚点命中 ' + count + ' 次（应为 1）：' + label + ' @ ' + rel);
+              console.error('  锚点首行：' + anchor.split('\n')[0]);
+              process.exit(1);
+            }
+            writeFileSync(p, src.replace(anchor, replacement), 'utf8');
+            hits++;
+            console.log('✓ ' + label + '  →  ' + rel);
+          }
+
+          // ---------------------------------------------------------------------------
+          // 1) Shared/JevModel.swift —— 配置的编解码（纯 Foundation，不需要 UIKit）
+          // ---------------------------------------------------------------------------
+          const jevModelAnchor = [
+            '#if DEBUG',
+            '    private static let diagKey = "jev.diag.v1"',
+          ].join('\n');
+
+          const jevModelBlock = [
+            '    // MARK: 配置搬运（签名没带 App Group 时的兜底通道）',
+            '    //',
+            '    // 正常情况配置放 App Group，App 与键盘读同一份。但自签工具不一定给键盘扩展',
+            '    // 带上 App Groups 权限，那样键盘进不了共享容器（UserDefaults(suiteName:) 返回 nil，',
+            '    // 静默退化成各自的私有容器），键盘就只能看到一份空配置。',
+            '    // 这条通道绕开共享容器：',
+            '    //   App「模型」页点「复制配置」→ 键盘上点「导入配置」→ 存进键盘自己的容器。',
+            '',
+            '    /// 信封标记：用来确认剪贴板里那段文本确实是本 App 导出的配置。',
+            '    static let clipboardTag = "jev.config.clipboard.v1"',
+            '',
+            '    private struct ClipboardEnvelope: Codable {',
+            '        var tag: String',
+            '        var config: JevConfig',
+            '    }',
+            '',
+            '    /// 把配置编码成一段可直接放进剪贴板的文本。',
+            '    static func clipboardText(_ cfg: JevConfig) -> String? {',
+            '        let env = ClipboardEnvelope(tag: clipboardTag, config: cfg)',
+            '        guard let data = try? JSONEncoder().encode(env) else { return nil }',
+            '        return String(data: data, encoding: .utf8)',
+            '    }',
+            '',
+            '    /// 从剪贴板文本解出配置；不是本 App 导出的返回 nil。',
+            '    static func config(fromClipboardText text: String) -> JevConfig? {',
+            '        guard let data = text.data(using: .utf8),',
+            '              let env = try? JSONDecoder().decode(ClipboardEnvelope.self, from: data),',
+            '              env.tag == clipboardTag else { return nil }',
+            '        return env.config',
+            '    }',
+            '',
+          ].join('\n');
+
+          patch('Shared/JevModel.swift', jevModelAnchor, jevModelBlock + jevModelAnchor, '配置编解码');
+
+          // ---------------------------------------------------------------------------
+          // 2) App/Sources/ProvidersView.swift —— 「复制配置到剪贴板」按钮
+          // ---------------------------------------------------------------------------
+          patch(
+            'App/Sources/ProvidersView.swift',
+            '    @State private var preset: String = "zhipu"',
+            [
+              '    @State private var preset: String = "zhipu"',
+              '    @State private var clipboardNote: String?',
+            ].join('\n'),
+            '配置页状态位'
+          );
+
+          const providersAnchor = [
+            '            TestConnectionButton(kind: .generation)',
+            '',
+            '            Text(genStatusLine)',
+          ].join('\n');
+
+          const providersBlock = [
+            '            TestConnectionButton(kind: .generation)',
+            '',
+            '            // 剪贴板搬运：自签安装时键盘扩展常拿不到 App Groups 权限，读不到这里的配置。',
+            '            // 点一下把配置放到剪贴板，键盘上「导入配置」即可，不必依赖共享容器。',
+            '            Button {',
+            '                if let text = JevStore.clipboardText(store.config) {',
+            '                    UIPasteboard.general.string = text',
+            '                    clipboardNote = jevLocalized(store.language,',
+            '                        zh: "✅ 已复制：切到 Jev 键盘，点「导入配置」",',
+            '                        en: "✅ Copied. Switch to the Jev keyboard and tap Import Config")',
+            '                } else {',
+            '                    clipboardNote = jevLocalized(store.language,',
+            '                        zh: "❌ 配置文本生成失败", en: "❌ Failed to encode the config")',
+            '                }',
+            '            } label: {',
+            '                Label(jevLocalized(store.language,',
+            '                                   zh: "复制配置到剪贴板（给键盘用）",',
+            '                                   en: "Copy config to clipboard (for the keyboard)"),',
+            '                      systemImage: "doc.on.clipboard")',
+            '            }',
+            '',
+            '            if let clipboardNote {',
+            '                Text(clipboardNote).font(.caption).foregroundStyle(.secondary)',
+            '            }',
+            '',
+            '            Text(genStatusLine)',
+          ].join('\n');
+
+          patch('App/Sources/ProvidersView.swift', providersAnchor, providersBlock, '复制配置按钮');
+
+          // ---------------------------------------------------------------------------
+          // 3) Keyboard/.../KeyboardViewController.swift —— 「导入配置」按钮 + 处理函数
+          // ---------------------------------------------------------------------------
+          patch(
+            'Keyboard/Sources/KeyboardViewController.swift',
+            '        tonesBtn.addTarget(self, action: #selector(openTonePicker), for: .touchUpInside)',
+            [
+              '        tonesBtn.addTarget(self, action: #selector(openTonePicker), for: .touchUpInside)',
+              '',
+              '        // 导入配置：自签安装时键盘扩展可能拿不到 App Groups 权限，读不到 App 里填的配置。',
+              '        // 这时用 App「模型」页的「复制配置」把配置放进剪贴板，在这里一键搬进键盘自己的容器。',
+              '        let importBtn = KB.button(L("导入配置", "Import Config"), icon: "square.and.arrow.down")',
+              '        importBtn.heightAnchor.constraint(equalToConstant: 34).isActive = true',
+              '        importBtn.addTarget(self, action: #selector(importConfigFromClipboard), for: .touchUpInside)',
+            ].join('\n'),
+            '导入按钮'
+          );
+
+          patch(
+            'Keyboard/Sources/KeyboardViewController.swift',
+            '        let vstack = UIStackView(arrangedSubviews: [guide, btnRow, tonesBtn])',
+            '        let vstack = UIStackView(arrangedSubviews: [guide, btnRow, tonesBtn, importBtn])',
+            '按钮入列'
+          );
+
+          patch(
+            'Keyboard/Sources/KeyboardViewController.swift',
+            '            vstack.addArrangedSubview(warn)',
+            [
+              '            vstack.addArrangedSubview(warn)',
+              '            vstack.addArrangedSubview(KB.label(',
+              '                L("若 App 里其实已经填好：点 App「模型」页的「复制配置」，再点上面的「导入配置」",',
+              '                  "If it is already set up in the app: tap Copy config in Models, then Import Config above"),',
+              '                font: .systemFont(ofSize: 11), color: KB.secondaryText, lines: 0))',
+            ].join('\n'),
+            '未配置提示'
+          );
+
+          patch(
+            'Keyboard/Sources/KeyboardViewController.swift',
+            '    @objc private func openTonePicker() { setMode(.tones) }',
+            [
+              '    /// 从剪贴板把 App 里的配置搬进键盘自己的容器（共享容器不可用时的兜底通道）。',
+              '    @objc private func importConfigFromClipboard() {',
+              '        let clip = UIPasteboard.general.string ?? ""',
+              '        guard let cfg = JevStore.config(fromClipboardText: clip) else {',
+              '            errorText = L("剪贴板里没有配置文本：先在 App「模型」页点「复制配置」",',
+              '                          "No config text on the clipboard: tap Copy config in Models first")',
+              '            setMode(.error)',
+              '            return',
+              '        }',
+              '        JevStore.saveConfig(cfg)',
+              '        setMode(.idle)',
+              '    }',
+              '',
+              '    @objc private func openTonePicker() { setMode(.tones) }',
+            ].join('\n'),
+            '导入处理函数'
+          );
+
+          console.log('');
+          console.log('补丁全部命中：' + hits + ' 处');
+
+          JSPATCH
+          node /tmp/patch-appgroup.mjs .
+          echo "--- 补丁后的改动确认 ---"
+          grep -nE "clipboardTag|clipboardText|复制配置到剪贴板" Shared/JevModel.swift App/Sources/ProvidersView.swift || true
+          grep -nE "importConfigFromClipboard|导入配置" Keyboard/Sources/KeyboardViewController.swift || true
+
+      - name: 编译（不做任何代码签名）
+        # 注意：这里刻意不加 -derivedDataPath。
+        # xcodebuild 规定 -derivedDataPath 只能和 -scheme 一起用，而 -target 才是
+        # 作者 README 里验证过的用法（工程里不一定有共享 scheme）。
+        # 产物位置下一步用 -showBuildSettings 问出来，不靠猜。
         run: |
           set -euo pipefail
           xcodebuild \
@@ -63,35 +271,35 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build 2>&1 | tee build.log | tail -n 80
 
-      - name: Locate app, verify keyboard extension, package unsigned ipa
+      - name: 定位 App、校验键盘扩展、打包成未签名 ipa
         run: |
           set -euo pipefail
 
           BUILT="$(xcodebuild -project JevJarvis.xcodeproj -target JevJarvis \
                      -configuration Release -sdk iphoneos -showBuildSettings 2>/dev/null \
                    | awk -F' = ' '/ BUILT_PRODUCTS_DIR = /{print $2; exit}')"
-          echo "BUILT_PRODUCTS_DIR = ${BUILT:-unknown}"
+          echo "BUILT_PRODUCTS_DIR = ${BUILT:-（没问出来）}"
 
           APP="${BUILT:-}/JevJarvis.app"
           if [ ! -d "$APP" ]; then
-            echo "not at the expected path, searching DerivedData"
+            echo "预期位置没有，改用 find 在 DerivedData 里搜"
             APP="$(find "$HOME/Library/Developer/Xcode/DerivedData" -type d -name 'JevJarvis.app' \
                    -path '*Release-iphoneos*' 2>/dev/null | head -n 1 || true)"
           fi
-          echo "APP = ${APP:-not found}"
+          echo "APP = ${APP:-（没找到）}"
 
           if [ -z "$APP" ] || [ ! -d "$APP" ]; then
-            echo "::error::JevJarvis.app not found - build products are not where expected"
+            echo "::error::找不到 JevJarvis.app，编译产物不在预期位置"
             exit 1
           fi
 
-          echo "=== App contents ==="
+          echo "=== App 内容 ==="
           ls -la "$APP"
-          echo "=== PlugIns (the keyboard extension must be here) ==="
+          echo "=== PlugIns（键盘扩展应该在这里）==="
           ls -la "$APP/PlugIns" || true
 
           if [ ! -d "$APP/PlugIns/JevKeyboard.appex" ]; then
-            echo "::error::JevKeyboard.appex is missing - the extension was not embedded, the package would be useless"
+            echo "::error::App 里没有 PlugIns/JevKeyboard.appex，键盘扩展没被嵌进去，这个包装上也用不了键盘"
             exit 1
           fi
 
@@ -100,39 +308,40 @@ jobs:
           cp -R "$APP" Payload/
           zip -qry JevJarvis-unsigned.ipa Payload
           ls -la JevJarvis-unsigned.ipa
-          echo "=== ipa layout (should contain JevKeyboard.appex) ==="
+          echo "=== ipa 结构（应包含 JevKeyboard.appex）==="
           unzip -l JevJarvis-unsigned.ipa | head -n 30
 
-      - name: Write result and errors to the run page (always)
+      - name: 把结果和错误写到运行页上（无论成败都执行）
         if: always()
         run: |
           {
-            echo "## Result"
+            echo "## 结果"
             if [ -f JevJarvis-unsigned.ipa ]; then
-              echo "- OK: JevJarvis-unsigned.ipa built ($(du -h JevJarvis-unsigned.ipa | cut -f1))"
-              echo "- Download it under Artifacts at the bottom of this page"
+              echo "- ✅ 已生成 JevJarvis-unsigned.ipa（$(du -h JevJarvis-unsigned.ipa | cut -f1)）"
+              echo "- 去本页最下方 Artifacts 下载"
+              echo "- 这个包已经带上「键盘不依赖 App Group」的补丁"
             else
-              echo "- FAILED: no ipa was produced (see the error lines below)"
+              echo "- ❌ 没有生成 ipa（看下面的错误行）"
             fi
             echo ""
-            echo "### Environment"
+            echo "### 环境"
             echo '```'
             sw_vers || true
             xcodebuild -version || true
             echo '```'
             if [ -f build.log ]; then
-              echo "### Error lines from the build log"
+              echo "### 编译日志里的错误行"
               echo '```'
               grep -i -E "error:|xcodebuild: error|requires a development team|The following build commands failed|Command .* failed" build.log | tail -n 40 || true
               echo '```'
-              echo "### Last 30 lines of the log"
+              echo "### 日志最后 30 行"
               echo '```'
               tail -n 30 build.log || true
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload ipa (download under Artifacts)
+      - name: 上传 ipa（运行记录页底部 Artifacts 下载）
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -140,7 +349,7 @@ jobs:
           path: JevJarvis-unsigned.ipa
           if-no-files-found: warn
 
-      - name: Upload build log too
+      - name: 编译日志也传一份
         if: always()
         uses: actions/upload-artifact@v7
         with:
