@@ -5,6 +5,17 @@
 #
 # 用法见同目录 README-自签安装.md。
 #
+# ── v5 相对 v4 的变化（现在用这一版）────────────────────────────────────────
+# 只做两件事，目的都是「一次运行必定拿到能装的包」：
+#   1) 源码钉死在官方 commit 上（checkout jev-chat/jev-chat-jarvis-ios）。
+#      你的 fork 是最新、被你自己改过什么都无所谓，编的永远是我验证过的那一份；
+#      本地所有补丁锚点都是对着这个 commit 逐文件核过 sha 的（72/72 文件一致）。
+#   2) 补丁版编不过 → 自动回退：把源码恢复成官方原样、clean 后重编一次。
+#      一次运行至少交出**一个** ipa，而不是空手而归。运行页第一行会写明产物来源：
+#        patched  = 带补丁（要装的就是它）
+#        original = 官方原版（键盘很可能读不到 App 里填的配置 → 先别装，把日志发我）
+#      artifact 名字也会带 patched / original，两个包不会认错。
+#
 # ── v4 相对 v3 的变化 ───────────────────────────────────────────────────────
 # 多打一个补丁：判断层按官方口径发请求。治的是「意图徽章不管发什么消息都判成
 # 同一类（实测一直落在『约会议』）、置信度还很低」——这不是模型很自信地判错，
@@ -50,8 +61,30 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: 取代码
+      - name: 取代码（官方仓库，取完整历史）
         uses: actions/checkout@v7
+        with:
+          # 直接取官方源码（不是你的 fork），所以 fork 是最新、被你改过什么都无所谓。
+          repository: jev-chat/jev-chat-jarvis-ios
+          # 先取完整历史：下一步要在本地检出那个验证过的 commit，
+          # 这样就不依赖「GitHub 允不允许按 sha 抓取」这件事（我在这儿没法实测，所以绕开它）。
+          ref: master
+          fetch-depth: 0
+
+      - name: 钉到验证过的那个 commit
+        run: |
+          set -euo pipefail
+          # 这就是本地逐文件核过 sha 的那个 commit（72/72 文件一致），补丁锚点全是对着它验的。
+          WANT=3c4af88dc9f5710076dfb526b98dea78518397c1
+          if git cat-file -e "${WANT}^{commit}" 2>/dev/null; then
+            git checkout --detach "$WANT"
+            echo "已钉在 ${WANT}（$(git log -1 --format=%cd --date=short)）"
+          else
+            echo "::warning::本地历史里找不到 ${WANT}（作者可能改写过历史），退回 master 最新：$(git rev-parse --short HEAD)"
+          fi
+          echo "当前 HEAD：$(git rev-parse HEAD)"
+          git log -1 --format='%h %ad %s' --date=short
+          echo "--- 想跟作者的新版本：把上面那个 WANT 换成新 commit（先跑本地自验，见 README 第十一节）---"
 
       - name: 环境信息（排查用）
         run: |
@@ -66,6 +99,9 @@ jobs:
           xcodebuild -list -project JevJarvis.xcodeproj || true
 
       - name: 打补丁 1/2：让键盘不依赖 App Group
+        id: patch1
+        # 补丁打不上不算致命：后面会自动回退到官方原版源码重编一次
+        continue-on-error: true
         run: |
           cat > /tmp/patch-appgroup.mjs <<'JSPATCH'
           // ============================================================================
@@ -343,6 +379,9 @@ jobs:
           grep -nE "importConfigFromClipboard|导入配置" Keyboard/Sources/KeyboardViewController.swift || true
 
       - name: 打补丁 2/2：判断层按官方口径（英文 criteria）+ 请求体稳定
+        id: patch2
+        # 同上：打不上就回退编官方原版
+        continue-on-error: true
         run: |
           cat > /tmp/patch-judge-en.mjs <<'JSPATCH2'
           // ============================================================================
@@ -562,6 +601,54 @@ jobs:
 
           patch('Shared/JevJudge.swift', JUDGE_RANK_ANCHOR, JUDGE_RANK_REPLACEMENT, '排序题 instructions 换英文（criteria 仍是候选原文）');
 
+          // 2d) 排序题 criteria 的形状改成官方写法。
+          // 官方（安卓版 build_rank_question，逐字一致）：key 用 reply_a/reply_b/…，
+          // 把候选原文放进 value。iOS 原版写成「候选原文当 key、value 用 null」——
+          // 网关认不出这种形状时，界面上的候选百分比会一排 0%。
+          const JUDGE_RANK_CRITERIA_ANCHOR = `        // 去重后再当选项：两个槽位选了同一个话术时，模型很可能给出两条一模一样的候选，
+                  // 而字典键不能重复（用 uniqueKeysWithValues 会直接 trap 崩掉键盘）。
+                  let criteria = Dictionary(candidates.map { ($0, NSNull()) }, uniquingKeysWith: { first, _ in first })`;
+
+          const JUDGE_RANK_CRITERIA_REPLACEMENT = `        // 与官方 build_rank_question 同形状：key 是 reply_a/reply_b/…，value 是候选原文。
+                  // （原版是「候选原文当 key、value 用 null」，网关判不出的话界面会一排 0%。）
+                  // 用编号当 key 还顺带避开了「两条候选文字一样时字典键重复」的老坑。
+                  let slots = ["reply_a", "reply_b", "reply_c", "reply_d", "reply_e", "reply_f", "reply_g", "reply_h"]
+                  var criteria: [String: String] = [:]
+                  for (i, c) in candidates.enumerated() where i < slots.count {
+                      criteria[slots[i]] = c
+                  }`;
+
+          patch('Shared/JevJudge.swift', JUDGE_RANK_CRITERIA_ANCHOR, JUDGE_RANK_CRITERIA_REPLACEMENT, '排序题 criteria 改成 reply_x → 候选原文');
+
+          const JUDGE_RANK_PARSE_ANCHOR = `        let probs = doubleDict(ans["probabilities"])
+                  var ranked = candidates.map { c -> RankedCandidate in
+                      var p = probs[c] ?? 0
+                      if p == 0, let choice = ans["choice"] as? String, choice == c {
+                          p = doubleValue(ans["confidence"])   // 网关可能只回显选中项
+                      }
+                      return RankedCandidate(text: c, prob: p)
+                  }
+                  ranked.sort { $0.prob > $1.prob }
+                  return ranked`;
+
+          const JUDGE_RANK_PARSE_REPLACEMENT = `        let probs = doubleDict(ans["probabilities"])   // 键是 reply_x
+                  let choice = ans["choice"] as? String
+                  var ranked: [RankedCandidate] = []
+                  for (i, c) in candidates.enumerated() where i < slots.count {
+                      let k = slots[i]
+                      var p = probs[k] ?? 0
+                      if p == 0, choice == k {
+                          p = doubleValue(ans["confidence"])   // 网关可能只回显选中项
+                      }
+                      ranked.append(RankedCandidate(text: c, prob: p))
+                  }
+                  ranked.sort { $0.prob > $1.prob }
+                  // 两个槽位选中同一个话术时可能出现文字完全相同的两条，去重后只留分高的那条
+                  var seen = Set<String>()
+                  return ranked.filter { seen.insert($0.text).inserted }`;
+
+          patch('Shared/JevJudge.swift', JUDGE_RANK_PARSE_ANCHOR, JUDGE_RANK_PARSE_REPLACEMENT, '排序结果改按 reply_x 取概率（并去重）');
+
           // ---------------------------------------------------------------------------
           // 3) JevHTTP.swift：请求体加 .sortedKeys
           // ---------------------------------------------------------------------------
@@ -624,7 +711,11 @@ jobs:
           fi
           echo "ok：中文 criteria 已全部换掉"
 
-      - name: 编译（不做任何代码签名）
+      - name: 编译 1/2（补丁版，不做任何代码签名）
+        id: build1
+        # 只有两个补丁都打上了才编这一版；编不过也不致命，下一步会回退重编。
+        if: steps.patch1.outcome == 'success' && steps.patch2.outcome == 'success'
+        continue-on-error: true
         # 注意：这里刻意不加 -derivedDataPath。
         # xcodebuild 规定 -derivedDataPath 只能和 -scheme 一起用，而 -target 才是
         # 作者 README 里验证过的用法（工程里不一定有共享 scheme）。
@@ -640,11 +731,57 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build 2>&1 | tee build.log | tail -n 80
+            build 2>&1 | tee build1.log | tail -n 80
+          # 走到这里说明 pipefail 没报错 = 编译成功
+          echo patched > variant.txt
+          echo "variant=patched" >> "$GITHUB_OUTPUT"
+
+      - name: 编译 2/2（回退：官方原版源码，不打任何补丁）
+        # 补丁没打上、或者补丁版编不过，就把源码恢复成官方原样再编一次。
+        # 这样一次运行至少能交出一个 ipa，而不是空手而归（哪种版本会在运行页写明）。
+        if: steps.build1.outcome != 'success'
+        id: build2
+        continue-on-error: true
+        run: |
+          set -uo pipefail   # 刻意不要 -e：失败信息要打全，最后自己判
+          echo "::notice::补丁版没拿到可用产物，回退到官方原版源码重编"
+          git checkout -- .
+          if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            echo "::warning::回退后工作区仍有改动（下面列出来的就是）："
+            git status --porcelain --untracked-files=no
+          fi
+          echo "--- 确认补丁痕迹已经没了（下面两条不该有输出）---"
+          grep -nE "enum JevWire|wireToIntent" Shared/JevPrompts.swift || true
+          grep -nE "sortedKeys" Shared/JevHTTP.swift || true
+          echo "ok：源码已回到官方原版"
+          # 清掉上一版的编译中间产物，避免增量编译混进补丁版的目标文件
+          xcodebuild -project JevJarvis.xcodeproj -target JevJarvis clean >/dev/null 2>&1 || true
+          if xcodebuild \
+               -project JevJarvis.xcodeproj \
+               -target JevJarvis \
+               -configuration Release \
+               -sdk iphoneos \
+               -destination 'generic/platform=iOS' \
+               CODE_SIGNING_ALLOWED=NO \
+               CODE_SIGNING_REQUIRED=NO \
+               CODE_SIGN_IDENTITY="" \
+               build 2>&1 | tee build2.log | tail -n 80
+          then
+            echo original > variant.txt
+            echo "variant=original" >> "$GITHUB_OUTPUT"
+            echo "✓ 官方原版编译成功（注意：这个包没有补丁）"
+          else
+            echo "::error::官方原版也编不过，看运行页下面的错误行和 build2.log"
+            exit 1
+          fi
 
       - name: 定位 App、校验键盘扩展、打包成未签名 ipa
+        if: always()
         run: |
           set -euo pipefail
+
+          VARIANT="$(cat variant.txt 2>/dev/null || echo unknown)"
+          echo "本次要打包的产物来源：${VARIANT}（patched=带补丁 / original=官方原版 / unknown=两版都没编过）"
 
           BUILT="$(xcodebuild -project JevJarvis.xcodeproj -target JevJarvis \
                      -configuration Release -sdk iphoneos -showBuildSettings 2>/dev/null \
@@ -660,7 +797,7 @@ jobs:
           echo "APP = ${APP:-（没找到）}"
 
           if [ -z "$APP" ] || [ ! -d "$APP" ]; then
-            echo "::error::找不到 JevJarvis.app，编译产物不在预期位置"
+            echo "::error::找不到 JevJarvis.app：补丁版和官方原版都没编出产物，看上面两步的日志"
             exit 1
           fi
 
@@ -685,12 +822,21 @@ jobs:
       - name: 把结果和错误写到运行页上（无论成败都执行）
         if: always()
         run: |
+          VARIANT="$(cat variant.txt 2>/dev/null || echo unknown)"
           {
             echo "## 结果"
             if [ -f JevJarvis-unsigned.ipa ]; then
               echo "- ✅ 已生成 JevJarvis-unsigned.ipa（$(du -h JevJarvis-unsigned.ipa | cut -f1)）"
-              echo "- 去本页最下方 Artifacts 下载"
-              echo "- 这个包带两个补丁：键盘不依赖 App Group + 判断层按官方口径（英文 criteria）"
+              echo "- sha256：\`$(shasum -a 256 JevJarvis-unsigned.ipa | cut -d' ' -f1)\`"
+              echo "- 产物来源：**${VARIANT}**"
+              if [ "$VARIANT" = "patched" ]; then
+                echo "- 带两个补丁：键盘不依赖 App Group（剪贴板搬运配置）+ 判断层按官方口径（英文 criteria）。这就是要装的那个包。"
+              elif [ "$VARIANT" = "original" ]; then
+                echo "- ⚠️ 这是**官方原版、没打上补丁**的包：补丁没命中或补丁版没编过。装上去后，键盘很可能读不到 App 里填的配置（点「分析剪贴板」没反应）。**先别急着装，把这一页和上面「打补丁」「编译」几步的日志发给助手。**"
+              else
+                echo "- ⚠️ 连产物来源都没写下来，说明两版都没编译成功。把这一页发我。"
+              fi
+              echo "- 去本页最下方 Artifacts 下载（名字带 patched / original）"
             else
               echo "- ❌ 没有生成 ipa（看下面的错误行）"
             fi
@@ -700,23 +846,25 @@ jobs:
             sw_vers || true
             xcodebuild -version || true
             echo '```'
-            if [ -f build.log ]; then
-              echo "### 编译日志里的错误行"
-              echo '```'
-              grep -i -E "error:|xcodebuild: error|requires a development team|The following build commands failed|Command .* failed" build.log | tail -n 40 || true
-              echo '```'
-              echo "### 日志最后 30 行"
-              echo '```'
-              tail -n 30 build.log || true
-              echo '```'
-            fi
+            for f in build1.log build2.log; do
+              if [ -f "$f" ]; then
+                echo "### $f 里的错误行"
+                echo '```'
+                grep -i -E "error:|xcodebuild: error|requires a development team|The following build commands failed|Command .* failed" "$f" | tail -n 40 || true
+                echo '```'
+                echo "### $f 最后 30 行"
+                echo '```'
+                tail -n 30 "$f" || true
+                echo '```'
+              fi
+            done
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传 ipa（运行记录页底部 Artifacts 下载）
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: JevJarvis-unsigned-ipa
+          name: JevJarvis-unsigned-ipa-${{ steps.build1.outputs.variant || steps.build2.outputs.variant || 'none' }}
           path: JevJarvis-unsigned.ipa
           if-no-files-found: warn
 
@@ -725,5 +873,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: build-log
-          path: build.log
-          if-no-files-found: ignore
+          path: |
+            build1.log
+            build2.log
+          if-no-files-found: warn
