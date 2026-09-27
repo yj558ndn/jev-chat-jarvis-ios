@@ -148,6 +148,49 @@ jobs:
           patch('Shared/JevModel.swift', jevModelAnchor, jevModelBlock + jevModelAnchor, '配置编解码');
 
           // ---------------------------------------------------------------------------
+          // 1b) Keyboard/.../KeyboardViewController.swift —— 导入结果的状态位
+          //     （待机页要显示「配置已导入 ✓」，否则导入成功也是静悄悄，用户以为没生效）
+          // ---------------------------------------------------------------------------
+          patch(
+            'Keyboard/Sources/KeyboardViewController.swift',
+            '    private var lastMessage: String = ""',
+            [
+              '    private var lastMessage: String = ""',
+              '    /// 导入配置后待机页上的一行反馈（空 = 不显示）。',
+              '    private var importNote: String = ""',
+            ].join('\n'),
+            '导入反馈状态位'
+          );
+
+          // ---------------------------------------------------------------------------
+          // 1c) 待机页：把上面那行反馈渲染出来
+          // ---------------------------------------------------------------------------
+          patch(
+            'Keyboard/Sources/KeyboardViewController.swift',
+            [
+              '        fitBlocks = [vstack]',
+              '        return vstack',
+              '    }',
+            ].join('\n'),
+            [
+              '        if !importNote.isEmpty {',
+              '            let genOK = JevDraft(cfg: cfg).isConfigured',
+              '            let judgeOK = JevJudge(cfg: cfg).isConfigured',
+              '            vstack.addArrangedSubview(KB.label(',
+              '                (genOK && judgeOK)',
+              '                    ? importNote + L("（两层 key 都在。回聊天长按消息 →「复制」→ 点「分析剪贴板」）",',
+              '                                     " (both layers OK. Copy the message in your chat, then tap Analyze Clipboard)")',
+              '                    : importNote + L("（有一层 key 还是空的，生成层必填）", " (one layer still has no key; generation is required)"),',
+              '                font: .systemFont(ofSize: 12), color: KB.riskColor(0), lines: 0))',
+              '        }',
+              '        fitBlocks = [vstack]',
+              '        return vstack',
+              '    }',
+            ].join('\n'),
+            '待机页显示导入反馈'
+          );
+
+          // ---------------------------------------------------------------------------
           // 2) App/Sources/ProvidersView.swift —— 「复制配置到剪贴板」按钮
           // ---------------------------------------------------------------------------
           patch(
@@ -249,12 +292,45 @@ jobs:
               '            return',
               '        }',
               '        JevStore.saveConfig(cfg)',
+              '        // 导入完必须把剪贴板清掉：键盘「分析剪贴板」分析的就是剪贴板内容，',
+              '        // 留着这段配置的话，接着点分析会把【配置文本】当成聊天消息去分析——',
+              '        // 剪贴板不变、结果就不变，看起来像"卡死在某个意图上"。',
+              '        UIPasteboard.general.string = ""',
+              '        importNote = L("✅ 配置已导入", "✅ Config imported")',
               '        setMode(.idle)',
               '    }',
               '',
               '    @objc private func openTonePicker() { setMode(.tones) }',
             ].join('\n'),
-            '导入处理函数'
+            '导入处理函数（并清空剪贴板）'
+          );
+
+          // 4) 再上一道保险：万一剪贴板里就是配置文本（用户自己复制回来、或旧版本留下的），
+          //    直接拦住并说清下一步，不要让用户对着一成不变的结果发呆。
+          patch(
+            'Keyboard/Sources/KeyboardViewController.swift',
+            [
+              '            errorText = L("剪贴板是空的。先在聊天里长按要回的消息 →「复制」，再回来点分析。", "The clipboard is empty. Long-press a message in your chat, copy it, then tap Analyze.")',
+              '            setMode(.error)',
+              '            return',
+              '        }',
+              '        run(message: text)',
+            ].join('\n'),
+            [
+              '            errorText = L("剪贴板是空的。先在聊天里长按要回的消息 →「复制」，再回来点分析。", "The clipboard is empty. Long-press a message in your chat, copy it, then tap Analyze.")',
+              '            setMode(.error)',
+              '            return',
+              '        }',
+              '        // 剪贴板里要还是 App「复制配置」留下的那段文本，被分析的就成了配置而不是聊天消息，',
+              '        // 而且剪贴板不变结果就不变（看着像卡死）。这里拦住，并直接告诉用户怎么继续。',
+              '        if JevStore.config(fromClipboardText: text) != nil {',
+              '            errorText = L("剪贴板里是【配置文本】（App「复制配置」留下的），不是聊天消息。\\n\\n请回聊天里长按对方那条消息 →「复制」，再回来点「分析剪贴板」。", "The clipboard holds config text (left over from Copy config), not a chat message.\\n\\nLong-press the message in your chat, copy it, then tap Analyze Clipboard again.")',
+              '            setMode(.error)',
+              '            return',
+              '        }',
+              '        run(message: text)',
+            ].join('\n'),
+            '分析前拦截「剪贴板里是配置文本」'
           );
 
           console.log('');
