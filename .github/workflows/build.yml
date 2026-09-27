@@ -1,0 +1,152 @@
+name: Build Jev Jarvis IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build iOS App
+    runs-on: macos-latest
+
+    steps:
+      # 1. 下载你的 Fork 源码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. 安装 XcodeGen
+      - name: Install XcodeGen
+        run: |
+          brew install xcodegen
+          xcodegen --version
+
+      # 3. 按项目自己的 project.yml 重新生成 Xcode 工程
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate
+
+      # 4. 显示 Xcode 环境
+      - name: Show build environment
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      # 5. 按作者 README 的官方方式进行无证书编译
+      - name: Build JevJarvis
+        run: |
+          xcodebuild \
+            -project JevJarvis.xcodeproj \
+            -target JevJarvis \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      # 6. 查找编译出来的 App
+      - name: Find JevJarvis.app
+        run: |
+          echo "Searching for JevJarvis.app..."
+
+          APP=$(find \
+            "$RUNNER_TEMP/DerivedData/Build/Products" \
+            -type d \
+            -name "JevJarvis.app" \
+            | head -n 1)
+
+          if [ -z "$APP" ]; then
+            echo "ERROR: JevJarvis.app was not found."
+            echo ""
+            echo "Build products:"
+            find "$RUNNER_TEMP/DerivedData/Build/Products" -maxdepth 5 -print
+            exit 1
+          fi
+
+          echo "Found:"
+          echo "$APP"
+
+          echo "APP_PATH=$APP" >> "$GITHUB_ENV"
+
+      # 7. 检查 App 内容
+      - name: Inspect App
+        run: |
+          echo "================================"
+          echo "JevJarvis.app"
+          echo "================================"
+
+          find "$APP_PATH" -maxdepth 3 -print
+
+          echo ""
+          echo "================================"
+          echo "PlugIns"
+          echo "================================"
+
+          if [ -d "$APP_PATH/PlugIns" ]; then
+            find "$APP_PATH/PlugIns" -maxdepth 3 -print
+          else
+            echo "WARNING: PlugIns directory not found."
+          fi
+
+      # 8. 检查键盘扩展
+      - name: Verify JevKeyboard
+        run: |
+          KEYBOARD="$APP_PATH/PlugIns/JevKeyboard.appex"
+
+          echo "Checking:"
+          echo "$KEYBOARD"
+
+          if [ -d "$KEYBOARD" ]; then
+            echo ""
+            echo "SUCCESS: JevKeyboard.appex exists."
+            echo ""
+
+            echo "Keyboard extension contents:"
+            find "$KEYBOARD" -maxdepth 2 -print
+          else
+            echo ""
+            echo "ERROR: JevKeyboard.appex was NOT found."
+            echo ""
+            echo "The App was compiled, but the keyboard extension"
+            echo "was not embedded in the application."
+            exit 1
+          fi
+
+      # 9. 创建 IPA
+      - name: Create IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/Payload"
+
+          cp -R \
+            "$APP_PATH" \
+            "$RUNNER_TEMP/Payload/JevJarvis.app"
+
+          cd "$RUNNER_TEMP"
+
+          rm -f JevJarvis-unsigned.ipa
+
+          zip -qry \
+            JevJarvis-unsigned.ipa \
+            Payload
+
+          echo ""
+          echo "================================"
+          echo "IPA created"
+          echo "================================"
+
+          ls -lh JevJarvis-unsigned.ipa
+
+      # 10. 上传 IPA
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: JevJarvis-unsigned-IPA
+          path: ${{ runner.temp }}/JevJarvis-unsigned.ipa
+          if-no-files-found: error
+
+      # 11. 同时保存完整 App，方便出问题时检查
+      - name: Upload App
+        uses: actions/upload-artifact@v4
+        with:
+          name: JevJarvis-App
+          path: ${{ env.APP_PATH }}
+          if-no-files-found: error
